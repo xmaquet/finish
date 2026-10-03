@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+logs/*.log
+logs/*.png
+recordings/*.mp4
+recordings/*.avi
+recordings/*.json
+.pytest_cache/
+dist/
+build/
