@@ -14,6 +14,7 @@ from video.archive_player import (
     frame_index_for_seconds,
     frame_index_for_wall_clock,
     locate_frame_for_clock_text,
+    natural_playback_fps,
     parse_clock_text,
     seconds_for_frame,
 )
@@ -23,6 +24,12 @@ class FrameMappingTest(unittest.TestCase):
     def test_seconds_and_frames_meet_in_the_middle(self) -> None:
         self.assertEqual(frame_index_for_seconds(2.0, 30, 100), 60)
         self.assertEqual(frame_index_for_seconds(99, 30, 100), 99)
+
+    def test_normal_speed_follows_the_real_duration_not_the_file_rate(self) -> None:
+        rate = natural_playback_fps(248, 48.076, 5.22, 15.0)
+        self.assertAlmostEqual(rate, 248 / 48.076)
+        self.assertLess(rate, 15.0)
+        self.assertAlmostEqual(rate * 2, natural_playback_fps(248, 48.076, 5.22, 15.0) * 2)
         self.assertAlmostEqual(seconds_for_frame(60, 30), 2.0)
 
     def test_wall_clock_uses_the_session_start(self) -> None:

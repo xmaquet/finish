@@ -31,6 +31,14 @@ QLabel#hint {
     border-radius: 6px;
     padding: 4px 8px;
 }
+QLabel#alert {
+    color: #842029;
+    background: rgba(248, 215, 218, 230);
+    border: 1px solid #f5c2c7;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-weight: 600;
+}
 QFrame#card, QWidget#side, QTreeWidget, QListWidget {
     background: rgba(255, 255, 255, 196);
     border: 1px solid rgba(255, 255, 255, 170);
@@ -114,6 +122,18 @@ QWidget#side QPushButton {
     min-height: 26px;
     padding: 4px 8px;
     font-size: 13px;
+}
+QPushButton#speed:checked {
+    background: #0d6efd;
+    color: #ffffff;
+    border: none;
+}
+QPushButton#speed:checked:hover {
+    background: #0b5ed7;
+}
+QPushButton#speed:checked:disabled {
+    background: #9ec5fe;
+    color: #ffffff;
 }
 QPushButton#nav, QPushButton#nav[active="true"] {
     background: transparent;

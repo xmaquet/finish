@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QStackedWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -59,7 +61,7 @@ from sessions.archive import reserve_new_session
 from sessions.catalog import RecordedSession, format_duration_minutes, scan_recordings
 from sessions.course import ActiveCourse, start_course
 from sessions.library import CourseArchive, build_courses, format_course_summary, format_summary, library_size
-from sessions.readiness import Readiness, course_readiness
+from sessions.readiness import NAME_FIRST_ALERT, Readiness, course_alerts, course_readiness
 from sessions.transfer import (
     ExportResult,
     delete_local_files,
@@ -72,10 +74,16 @@ from preferences import Preferences, load_preferences, save_preferences
 from ui.backdrop import AppBackdrop
 from ui.branding import logo_icon, logo_pixmap
 from version import ABOUT_TEXT, VERSION
+from help_text import HELP_HTML
 from ui.course_browser import CourseBrowser
 from ui.live_view import LiveView
 from ui.theme import APP_STYLE
-from video.archive_player import ArchivePlayer, locate_frame_for_clock_text, seconds_for_frame
+from video.archive_player import (
+    ArchivePlayer,
+    locate_frame_for_clock_text,
+    natural_playback_fps,
+    seconds_for_frame,
+)
 from video.jpeg_encode import decode_jpeg
 from video.recorder import RecorderError, SessionRecorder, file_frame_rate
 from video.replay import ReplayPlayer
@@ -108,6 +116,7 @@ class MainWindow(QMainWindow):
         self._archive_anchor_index = 0
         self._archive_anchor_mono = 0.0
         self._archive_slider_dragging = False
+        self._archive_speed = 1.0
         self._open_session_id: int | None = None
         self._logged_camera_started = False
         self._view = "idle"
@@ -210,6 +219,17 @@ class MainWindow(QMainWindow):
         self._archive_play_button = QPushButton("Lecture")
         self._archive_pause_button = QPushButton("Pause")
         self._archive_stop_button = QPushButton("Stop")
+        self._archive_speed_buttons: dict[float, QPushButton] = {}
+        self._archive_speed_group = QButtonGroup(self)
+        self._archive_speed_group.setExclusive(True)
+        for label, speed in (("x1", 1.0), ("x2", 2.0), ("x3", 3.0)):
+            button = QPushButton(label)
+            button.setObjectName("speed")
+            button.setCheckable(True)
+            button.setChecked(speed == 1.0)
+            self._archive_speed_group.addButton(button)
+            button.clicked.connect(lambda _checked=False, chosen=speed: self._set_archive_speed(chosen))
+            self._archive_speed_buttons[speed] = button
         self._archive_previous_button = QPushButton("< Image")
         self._archive_next_button = QPushButton("Image >")
         self._archive_close_button = QPushButton("Fermer")
@@ -293,6 +313,10 @@ class MainWindow(QMainWindow):
         self._set_folder_label(self._recordings_dir)
         self._readiness = QLabel("À vérifier")
         self._readiness.setObjectName("screenTitle")
+        self._alerts = QLabel("")
+        self._alerts.setObjectName("alert")
+        self._alerts.setWordWrap(True)
+        self._alerts.hide()
         self._autonomy = QLabel("")
         self._autonomy.setObjectName("muted")
         self._autonomy.setWordWrap(True)
@@ -303,12 +327,15 @@ class MainWindow(QMainWindow):
         self._finish_course_button = QPushButton("Terminer la course")
         self._about_button = QPushButton("À propos")
         self._about_button.setObjectName("nav")
+        self._help_button = QPushButton("Aide")
+        self._help_button.setObjectName("nav")
         self._detect_button.clicked.connect(self._detect_cameras)
-        self._test_button.clicked.connect(self._start_preview)
+        self._test_button.clicked.connect(self._on_test_clicked)
         self._folder_button.clicked.connect(self._choose_recordings_folder)
         self._finish_button.clicked.connect(self._finish_course)
         self._finish_course_button.clicked.connect(self._finish_course)
         self._about_button.clicked.connect(self._show_about)
+        self._help_button.clicked.connect(self._show_help)
         self._course_name_edit.textChanged.connect(lambda _text: self._refresh_readiness())
         self._place_edit.editingFinished.connect(self._persist_preferences)
         self._camera_combo.currentIndexChanged.connect(lambda _index: self._persist_preferences())
@@ -361,6 +388,7 @@ class MainWindow(QMainWindow):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 8, 12, 8)
         header_layout.addWidget(self._logo)
+        header_layout.addWidget(self._help_button)
         header_layout.addStretch(1)
         header_layout.addWidget(self._about_button)
         header_layout.addWidget(self._prepare_nav)
@@ -473,7 +501,14 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         title = QLabel("Pré-course")
         title.setObjectName("screenTitle")
+        self._prepare_preview = QWidget()
+        self._prepare_preview_layout = QVBoxLayout(self._prepare_preview)
+        self._prepare_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self._prepare_preview.setMinimumHeight(220)
+        self._prepare_preview.hide()
         layout.addWidget(title)
+        layout.addWidget(self._alerts)
+        layout.addWidget(self._prepare_preview, stretch=1)
         layout.addWidget(scroll, stretch=1)
         status = QFrame()
         status.setObjectName("card")
@@ -580,6 +615,10 @@ class MainWindow(QMainWindow):
         playback.addWidget(self._archive_pause_button)
         playback.addWidget(self._archive_stop_button)
         side_layout.addLayout(playback)
+        speeds = QHBoxLayout()
+        for speed in (1.0, 2.0, 3.0):
+            speeds.addWidget(self._archive_speed_buttons[speed])
+        side_layout.addLayout(speeds)
         frames = QHBoxLayout()
         frames.addWidget(self._archive_previous_button)
         frames.addWidget(self._archive_next_button)
@@ -650,17 +689,36 @@ class MainWindow(QMainWindow):
             self._hint.setText("La course continue. Démarrez une session, ou terminez la course.")
 
     def _show_course_page(self) -> None:
+        if self._preview_mode:
+            self._prepare_nav.setChecked(True)
+            return
+        if self._course is None and not self._session_controls_live():
+            self._show_prepare()
+            return
         if self._view in {"list", "archive"}:
             self._leave_archives()
         self._attach_live(self._course_video_layout, 0)
         self._stack.setCurrentIndex(1)
         self._course_nav.setChecked(True)
 
+    def _clear_active_course(self) -> None:
+        name = self._course.course_name if self._course is not None else self._entered_course_name()
+        self._course = None
+        self._set_course_text("—")
+        self._set_session_text("—")
+        self._course_name_edit.blockSignals(True)
+        self._course_name_edit.clear()
+        self._course_name_edit.blockSignals(False)
+        self._refresh_readiness()
+        self._update_transport_buttons()
+        if name:
+            logger.info("COURSE FINISHED course=%s", name)
+
     def set_course_name(self, raw_name: str | None) -> None:
         self._course = start_course(raw_name)
         self._set_course_text(self._course.course_name)
         self._course_name_edit.setText(self._course.course_name)
-        self._refresh_start_label()
+        self._update_transport_buttons()
         logger.info(
             "COURSE SET course=%s slug=%s",
             self._course.course_name,
@@ -821,13 +879,18 @@ class MainWindow(QMainWindow):
         self._begin_capture(record=True)
 
     def _prepare_course_start(self) -> bool:
-        name = self._course_name_edit.text().strip()
-        if not name and self._course is not None:
-            name = self._course.course_name
+        if self._alert_if_course_name_missing():
+            return False
+        name = self._entered_course_name()
         ready = self._current_readiness(name)
         self._show_readiness(ready)
         if not ready.allowed:
-            self._hint.setText(ready.detail)
+            detail = ready.detail
+            alerts = self._current_alerts(name)
+            if alerts:
+                detail = alerts[0]
+            self._hint.setText(detail)
+            QMessageBox.warning(self, "FINISH", detail)
             return False
         if (
             self._course is not None
@@ -884,13 +947,35 @@ class MainWindow(QMainWindow):
         )
         self._worker.start()
         self._timer.start()
-        self._show_course_page()
+        if record:
+            self._hide_prepare_preview()
+            self._show_course_page()
+        else:
+            self._show_prepare_preview()
         self._update_transport_buttons()
 
+    def _show_prepare_preview(self) -> None:
+        self._prepare_preview.show()
+        self._attach_live(self._prepare_preview_layout, 0)
+        self._stack.setCurrentIndex(0)
+        self._prepare_nav.setChecked(True)
+
+    def _hide_prepare_preview(self) -> None:
+        self._prepare_preview.hide()
+        if self._prepare_preview_layout.indexOf(self._live) >= 0:
+            self._attach_live(self._course_video_layout, 0)
+
+    def _on_test_clicked(self) -> None:
+        if self._preview_mode and self._worker is not None:
+            self._worker.stop()
+            return
+        self._start_preview()
+
     def _start_preview(self) -> None:
-        if self._worker is not None:
+        if self._worker is not None or self._detecting:
             return
         if not self._camera_available():
+            QMessageBox.warning(self, "FINISH", "Aucune caméra détectée.")
             self._hint.setText("Aucune caméra détectée.")
             return
         self._begin_capture(record=False)
@@ -932,6 +1017,7 @@ class MainWindow(QMainWindow):
         self._detecting = True
         self._detect_button.setEnabled(False)
         self._camera_report.setText("Recherche des caméras…")
+        self._update_transport_buttons()
         self._camera_timer.start()
         threading.Thread(target=self._detect_worker, name="camera-detect", daemon=True).start()
 
@@ -954,6 +1040,7 @@ class MainWindow(QMainWindow):
         if pending:
             self._fill_camera_combo(pending)
             self._camera_report.setText(" · ".join(choice.label for choice in pending))
+            logger.info("Cameras detected %s", " | ".join(choice.label for choice in pending))
             self._persist_preferences()
         else:
             self._camera_combo.blockSignals(True)
@@ -962,6 +1049,8 @@ class MainWindow(QMainWindow):
             self._camera_combo.blockSignals(False)
             self._camera_report.setText("Aucune caméra détectée")
         self._detect_button.setEnabled(self._worker is None)
+        self._refresh_readiness()
+        self._update_transport_buttons()
 
     def _camera_available(self) -> bool:
         return isinstance(self._camera_combo.currentData(), int)
@@ -1019,11 +1108,37 @@ class MainWindow(QMainWindow):
         except OSError:
             logger.exception("Preferences could not be saved")
 
+    def _entered_course_name(self) -> str:
+        name = self._course_name_edit.text().strip()
+        if not name and self._course is not None:
+            return self._course.course_name
+        return name
+
+    def _alert_if_course_name_missing(self) -> bool:
+        if self._entered_course_name():
+            return False
+        self._refresh_readiness()
+        QMessageBox.warning(self, "FINISH", NAME_FIRST_ALERT)
+        self._stack.setCurrentIndex(0)
+        self._prepare_nav.setChecked(True)
+        self._course_name_edit.setFocus()
+        return True
+
+    def _current_alerts(self, name: str | None = None) -> list[str]:
+        if name is None:
+            name = self._entered_course_name()
+        return course_alerts(
+            name or "",
+            self._recordings_dir,
+            self._free_for_recordings(),
+            DISK_FREE_WARNING_BYTES,
+            camera_available=self._camera_available(),
+            detecting=self._detecting,
+        )
+
     def _current_readiness(self, name: str | None = None):
         if name is None:
-            name = self._course_name_edit.text().strip()
-            if not name and self._course is not None:
-                name = self._course.course_name
+            name = self._entered_course_name()
         if self._detecting:
             return Readiness("À vérifier", "Recherche des caméras…", False)
         return course_readiness(
@@ -1035,7 +1150,15 @@ class MainWindow(QMainWindow):
         )
 
     def _show_readiness(self, ready) -> None:
-        self._readiness.setText(f"{ready.headline}\n{ready.detail}")
+        alerts = self._current_alerts()
+        if alerts:
+            self._alerts.setText("\n".join(alerts))
+            self._alerts.show()
+            self._readiness.setText(ready.headline)
+        else:
+            self._alerts.hide()
+            self._alerts.clear()
+            self._readiness.setText(f"{ready.headline}\n{ready.detail}")
 
     def _set_folder_label(self, folder: Path) -> None:
         shown = html.escape(str(folder))
@@ -1412,19 +1535,28 @@ class MainWindow(QMainWindow):
         self._archives_button.setEnabled(not live and not self._closing)
         self._archives_nav.setEnabled(not self._closing)
         self._prepare_nav.setEnabled(not live and not self._closing)
+        self._course_nav.setEnabled(not self._preview_mode and not self._closing)
         self._detect_button.setEnabled(not live and not self._detecting and not self._closing)
-        self._test_button.setEnabled(not live and not self._closing and self._camera_available())
+        self._test_button.setText("Arrêter le test" if self._preview_mode else "Tester caméra")
+        self._test_button.setEnabled(
+            not self._closing
+            and not self._detecting
+            and (self._preview_mode or (not live and self._camera_available()))
+        )
         self._start_button.setEnabled(not live and not watching and not browsing and not self._closing)
         self._start_session_button.setEnabled(not live and not self._closing and self._course is not None)
         self._refresh_start_label()
-        self._finish_button.setEnabled(not live and not self._closing)
-        self._finish_course_button.setEnabled(not live and not self._closing)
+        course_started = self._course is not None and not live and not self._closing
+        self._finish_button.setEnabled(course_started)
+        self._finish_course_button.setEnabled(course_started)
         self._stop_button.setText("Arrêter le test" if self._preview_mode and live else "Arrêter session")
         self._open_archive_button.setEnabled(browsing)
         stepped = watching and not self._archive_playing
         self._archive_play_button.setEnabled(watching and not self._archive_playing)
         self._archive_pause_button.setEnabled(watching and self._archive_playing)
         self._archive_stop_button.setEnabled(watching)
+        for button in self._archive_speed_buttons.values():
+            button.setEnabled(watching)
         self._archive_previous_button.setEnabled(stepped)
         self._archive_next_button.setEnabled(stepped)
         self._archive_close_button.setEnabled(watching)
@@ -1457,10 +1589,17 @@ class MainWindow(QMainWindow):
         self._log_life("CAMERA STOPPED")
         if not self._preview_mode:
             self._log_life("SESSION CLOSED")
+        was_preview = self._preview_mode
         self._preview_mode = False
         self._open_session_id = None
         self._logged_camera_started = False
         self._live.clear_frame()
+        self._hide_prepare_preview()
+        if was_preview and not self._closing:
+            self._show_prepare()
+            self._hint.setText("Test terminé. La caméra est libérée.")
+            self._update_transport_buttons()
+            return
         self._show_idle()
 
     def _refresh_start_label(self) -> None:
@@ -1609,6 +1748,7 @@ class MainWindow(QMainWindow):
         )
         self._replay_value.setText("")
         self._goto_edit.clear()
+        self._set_archive_speed(1.0)
         self._paint_archive_frame()
         self._hint.setText("Lecture d'archive. La caméra n'est pas utilisée.")
         self._update_transport_buttons()
@@ -1762,6 +1902,31 @@ class MainWindow(QMainWindow):
         delete_local_files(paths)
         self._show_archive_list()
 
+    def _archive_natural_fps(self) -> float:
+        session = self._archive_session
+        player = self._archive_player
+        if session is None:
+            return player.file_fps if player.file_fps > 0 else 30.0
+        return natural_playback_fps(
+            session.frames_written,
+            session.duration_seconds,
+            session.measured_fps,
+            player.file_fps if player.file_fps > 0 else session.file_fps,
+        )
+
+    def _archive_playback_fps(self) -> float:
+        return max(1.0, self._archive_natural_fps() * self._archive_speed)
+
+    def _set_archive_speed(self, speed: float) -> None:
+        self._archive_speed = speed
+        button = self._archive_speed_buttons.get(speed)
+        if button is not None:
+            button.setChecked(True)
+        if self._archive_playing and self._archive_player.is_open:
+            self._archive_anchor_index = max(0, self._archive_player.frame_index)
+            self._archive_anchor_mono = time.monotonic()
+            self._archive_timer.setInterval(max(15, int(round(1000 / self._archive_playback_fps()))))
+
     def _play_archive(self) -> None:
         player = self._archive_player
         if not player.is_open:
@@ -1769,7 +1934,7 @@ class MainWindow(QMainWindow):
         if player.frame_index >= player.frame_count - 1:
             player.seek(0)
             self._paint_archive_frame()
-        fps = player.file_fps if player.file_fps > 0 else 30.0
+        fps = self._archive_playback_fps()
         self._archive_anchor_index = player.frame_index
         self._archive_anchor_mono = time.monotonic()
         self._archive_timer.setInterval(max(15, int(round(1000 / fps))))
@@ -1799,7 +1964,7 @@ class MainWindow(QMainWindow):
         if not player.is_open or not self._archive_playing or self._archive_slider_dragging:
             return
         elapsed = time.monotonic() - self._archive_anchor_mono
-        fps = player.file_fps if player.file_fps > 0 else 30.0
+        fps = self._archive_playback_fps()
         target = self._archive_anchor_index + int(elapsed * fps)
         if target >= player.frame_count - 1:
             player.seek(player.frame_count - 1)
@@ -1813,8 +1978,9 @@ class MainWindow(QMainWindow):
         player = self._archive_player
         if player.frame is not None:
             self._live.set_frame_bgr(player.frame)
-        total = player.frame_count / player.file_fps if player.file_fps > 0 else 0.0
-        current = seconds_for_frame(max(0, player.frame_index), player.file_fps)
+        rate = self._archive_natural_fps()
+        total = player.frame_count / rate if rate > 0 else 0.0
+        current = seconds_for_frame(max(0, player.frame_index), rate)
         self._archive_time.setText(f"{_format_hms(current)} / {_format_hms(total)}")
         if not self._archive_slider_dragging:
             self._archive_slider.blockSignals(True)
@@ -1842,7 +2008,7 @@ class MainWindow(QMainWindow):
         located = locate_frame_for_clock_text(
             session.start_time,
             self._goto_edit.text(),
-            player.file_fps,
+            self._archive_natural_fps(),
             player.frame_count,
         )
         if located is None:
@@ -1888,15 +2054,22 @@ class MainWindow(QMainWindow):
                 "La capture en cours ne sera pas interrompue.",
             )
             return
-        name = self._course_name_edit.text().strip()
-        if not name and self._course is not None:
-            name = self._course.course_name
-        if not name:
-            QMessageBox.information(self, "FINISH", "Indiquez le nom de la course.")
+        if self._course is None:
             return
-        self._show_archive_list()
+        name = self._entered_course_name()
+        answer = QMessageBox.question(
+            self,
+            "FINISH",
+            f"Terminer la course {name} ?\nConfirmez pour clôturer la course en cours.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         courses = build_courses(scan_recordings(self._recordings_dir))
         course = next((item for item in courses if item.course_name == name), None)
+        self._clear_active_course()
+        self._show_archive_list()
         if course is not None:
             self._course_browser.open_course(course)
         text = format_course_summary(course) if course is not None else format_summary(name, 0, 0, 0)
@@ -1913,8 +2086,27 @@ class MainWindow(QMainWindow):
             self._export_one_course(course)
         elif chosen is home:
             self._show_prepare()
+            self._hint.setText("Course terminée.")
         elif chosen is see and course is None:
-            self._hint.setText("Cette course n'a pas encore de session.")
+            self._hint.setText("Course terminée. Cette course n'a pas encore de session.")
+        elif chosen is see:
+            self._hint.setText("Course terminée.")
+        else:
+            self._hint.setText("Course terminée.")
+
+    def _show_help(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Aide — Finish {VERSION}")
+        dialog.resize(560, 640)
+        layout = QVBoxLayout(dialog)
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(HELP_HTML)
+        layout.addWidget(browser)
+        close = QPushButton("Fermer")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
 
     def _show_about(self) -> None:
         box = QMessageBox(self)

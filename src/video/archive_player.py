@@ -34,6 +34,27 @@ def seconds_for_frame(index: int, file_fps: float) -> float:
     return max(0, index) / file_fps
 
 
+def natural_playback_fps(
+    frames_written: int,
+    duration_seconds: float,
+    measured_fps: float,
+    file_fps: float,
+) -> float:
+    """Cadence qui fait avancer l'horloge incrustée en temps réel.
+
+    Le conteneur est souvent plus rapide que la capture. Lire à file_fps
+    accélère la session. La vitesse normale est le nombre d'images divisé
+    par la durée réelle.
+    """
+    if frames_written > 0 and duration_seconds > 0:
+        return frames_written / duration_seconds
+    if measured_fps > 1:
+        return measured_fps
+    if file_fps > 0:
+        return file_fps
+    return 30.0
+
+
 def frame_index_for_wall_clock(
     start: datetime,
     target: datetime,
